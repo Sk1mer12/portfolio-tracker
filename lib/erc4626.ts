@@ -477,17 +477,16 @@ async function fetchVaultLogs(
 /**
  * For each vault, resolve the net deposited underlying asset amount.
  *
- * ERC-4626 vaults (vaultType "erc4626"):
- *   Fetch all logs emitted by the vault contract and filter for standard
- *   Deposit / Withdraw events where the indexed `owner` matches the user.
- *   netDeposited = Σ Deposit.assets  −  Σ Withdraw.assets
- *   No per-transaction fetching required — one paginated call per vault.
+ * All vault types use the same token-transfer-based approach:
+ *   1. Fetch the user's vault share token transfers (mint = deposit, burn = withdrawal)
+ *      via Blockscout's per-user token-transfer endpoint — only the user's own events,
+ *      regardless of how busy the vault is.
+ *   2. Decode the underlying asset amount from each transaction's logs.
  *
- * Aave aTokens (vaultType "aave"):
- *   Transfer amounts are used directly — aToken balance is 1:1 with underlying.
- *
- * Lock / custom vaults (vaultType "lock" | "custom"):
- *   Fall back to per-transaction log decoding via Blockscout token-transfer API.
+ * Per-type asset decoding:
+ *   erc4626 — Deposit/Withdraw event: data[0..32] = assets (abi.encode uint256)
+ *   aave    — aToken balance is 1:1 with underlying; use transfer amount directly
+ *   lock/custom — Deposit/Supply/Enter or Withdraw/Exit event decoding with fallback
  *
  * Returns a Map keyed by `${chainId}:${vaultAddress}` (address lowercased).
  */
@@ -510,69 +509,45 @@ export async function fetchVaultDepositInfo(
 
       const vaultAddr = v.vaultAddress.toLowerCase();
       const key       = `${v.chainId}:${vaultAddr}`;
+      const NULL_ADDR = "0x0000000000000000000000000000000000000000";
 
-      // ── ERC-4626: read Deposit/Withdraw events directly from contract logs ────
-      if (v.vaultType === "erc4626") {
+      // Decode underlying asset amount from a transaction's logs.
+      // Pass 1: match by raw topic hash restricted to this vault address.
+      // Pass 2: Blockscout decoded-event fallback for non-standard naming.
+      const getAssetsFromTx = async (txHash: string, eventNames: string[]): Promise<bigint> => {
         try {
-          const allLogs = await fetchVaultLogs(explorer, v.vaultAddress);
-
-          // ERC-4626 indexed layout:
-          //   Deposit(address indexed caller, address indexed owner, uint256 assets, uint256 shares)
-          //     topic[2] = owner (the user whose shares are minted)
-          //   Withdraw(address indexed caller, address indexed receiver, address indexed owner, ...)
-          //     topic[3] = owner (the user whose shares are burned)
-          // Non-indexed params: abi.encode(uint256 assets, uint256 shares)
-          //   data[2:66] hex = assets (first 32-byte word)
-          const paddedUser = "0x" + "0".repeat(24) + v.userAddress.slice(2).toLowerCase();
-
-          let totalDeposited    = BigInt(0);
-          let totalDepositFloat = 0;  // float-precision running sum for weighted timestamp
-          let weightedTsAccum   = 0;  // Σ (floatAmount × unixMs)
-          let firstDepositMs: number | null = null;
-
-          for (const log of allLogs) {
-            if ((log.topics?.[0] ?? "").toLowerCase() !== ERC4626_DEPOSIT_TOPIC) continue;
-            if ((log.topics?.[2] ?? "").toLowerCase() !== paddedUser) continue;
-            const data: string = log.data ?? "";
-            if (data.length < 66) continue;
-
-            const rawAmt   = BigInt("0x" + data.slice(2, 66));
-            const floatAmt = bigintToFloat(rawAmt, v.underlyingDecimals);
-            totalDeposited    += rawAmt;
-            totalDepositFloat += floatAmt;
-
-            const ms = log.timestamp ? new Date(log.timestamp).getTime() : null;
-            if (ms) {
-              weightedTsAccum += floatAmt * ms;
-              if (firstDepositMs === null || ms < firstDepositMs) firstDepositMs = ms;
+          const res = await fetch(`${explorer}/api/v2/transactions/${txHash}/logs`, {
+            signal: AbortSignal.timeout(6000),
+          });
+          if (!res.ok) return BigInt(0);
+          const { items } = await res.json();
+          for (const log of items ?? []) {
+            const sig     = (log.topics?.[0] ?? "").toLowerCase();
+            const logAddr = (log.address?.hash ?? "").toLowerCase();
+            if (logAddr !== vaultAddr) continue;
+            if (
+              (eventNames.includes("Deposit")  && sig === ERC4626_DEPOSIT_TOPIC) ||
+              (eventNames.includes("Withdraw") && sig === ERC4626_WITHDRAW_TOPIC)
+            ) {
+              const data: string = log.data ?? "";
+              if (data.length >= 66) return BigInt("0x" + data.slice(2, 66));
             }
           }
-
-          if (totalDeposited === BigInt(0)) return;
-
-          let totalWithdrawn = BigInt(0);
-          for (const log of allLogs) {
-            if ((log.topics?.[0] ?? "").toLowerCase() !== ERC4626_WITHDRAW_TOPIC) continue;
-            if ((log.topics?.[3] ?? "").toLowerCase() !== paddedUser) continue;
-            const data: string = log.data ?? "";
-            if (data.length < 66) continue;
-            totalWithdrawn += BigInt("0x" + data.slice(2, 66));
+          for (const log of items ?? []) {
+            const method: string = log.decoded?.method_call ?? "";
+            if (!eventNames.some((n) => method.startsWith(n))) continue;
+            const params: any[] = log.decoded?.parameters ?? [];
+            const p = params.find((x: any) => x.name === "assets" || x.name === "amount");
+            if (p?.value) return BigInt(p.value);
           }
+        } catch { /* ignore */ }
+        return BigInt(0);
+      };
 
-          const netRaw         = totalDeposited > totalWithdrawn ? totalDeposited - totalWithdrawn : BigInt(0);
-          const weightedAvgMs  = totalDepositFloat > 0 ? weightedTsAccum / totalDepositFloat : null;
-
-          result.set(key, {
-            netDepositedAssets:   bigintToFloat(netRaw, v.underlyingDecimals),
-            firstDepositAt:       firstDepositMs !== null ? new Date(firstDepositMs).toISOString() : null,
-            weightedAvgDepositAt: weightedAvgMs  !== null ? new Date(weightedAvgMs).toISOString()  : null,
-          });
-        } catch { /* network error — skip vault */ }
-        return;
-      }
-
-      // ── Aave / lock / custom: Transfer-based approach ─────────────────────────
       try {
+        // Fetch all vault share token transfers for this specific user.
+        // This is O(user's transactions), not O(all vault events), so it reliably
+        // reaches early deposits even on high-traffic vaults.
         const [inItems, outItems] = await Promise.all([
           fetchAllTransfers(
             `${explorer}/api/v2/addresses/${v.userAddress}/token-transfers?token=${v.vaultAddress}&filter=to`
@@ -582,95 +557,105 @@ export async function fetchVaultDepositInfo(
           ),
         ]);
 
-        const NULL_ADDR  = "0x0000000000000000000000000000000000000000";
-        const depositTxs = inItems.filter((t: any) => t.from?.hash?.toLowerCase() === NULL_ADDR);
-        const allOutTxs  = outItems as any[];
+        // Deposits = incoming mints (from 0x0); withdrawals = outgoing burns (to 0x0)
+        const depositTxs  = inItems.filter((t: any) => t.from?.hash?.toLowerCase() === NULL_ADDR);
+        const withdrawTxs = outItems.filter((t: any) => t.to?.hash?.toLowerCase()   === NULL_ADDR);
 
         if (depositTxs.length === 0) return;
 
-        const earliestTimestamp: string | null = depositTxs[depositTxs.length - 1]?.timestamp ?? null;
-        const firstDepositAt = earliestTimestamp ? new Date(earliestTimestamp).toISOString() : null;
-
-        // Decode asset amount from a single transaction's logs.
-        // Pass 1: raw topic matching restricted to vaultAddr (prevents multi-contract tx collisions).
-        // Pass 2: Blockscout decoded-event fallback (handles Supply/Enter naming variants).
-        const getAssetsFromTx = async (txHash: string, eventNames: string[]): Promise<bigint> => {
-          try {
-            const res = await fetch(`${explorer}/api/v2/transactions/${txHash}/logs`, {
-              signal: AbortSignal.timeout(6000),
-            });
-            if (!res.ok) return BigInt(0);
-            const { items } = await res.json();
-
-            for (const log of items ?? []) {
-              const sig     = (log.topics?.[0] ?? "").toLowerCase();
-              const logAddr = (log.address?.hash ?? "").toLowerCase();
-              if (logAddr !== vaultAddr) continue;
-              if (
-                (eventNames.includes("Deposit")  && sig === ERC4626_DEPOSIT_TOPIC) ||
-                (eventNames.includes("Withdraw") && sig === ERC4626_WITHDRAW_TOPIC)
-              ) {
-                const data: string = log.data ?? "";
-                if (data.length >= 66) return BigInt("0x" + data.slice(2, 66));
-              }
-            }
-            for (const log of items ?? []) {
-              const method: string = log.decoded?.method_call ?? "";
-              if (!eventNames.some((n) => method.startsWith(n))) continue;
-              const params: any[] = log.decoded?.parameters ?? [];
-              const p = params.find((x: any) => x.name === "assets" || x.name === "amount");
-              if (p?.value) return BigInt(p.value);
-            }
-          } catch { /* ignore */ }
-          return BigInt(0);
-        };
-
-        let totalDeposited = BigInt(0);
+        // ── Accumulate deposit amounts + timestamps ─────────────────────────
+        let totalDeposited    = BigInt(0);
+        let totalDepositFloat = 0;
+        let weightedTsAccum   = 0;
+        let firstDepositMs: number | null = null;
 
         if (v.vaultType === "aave") {
+          // aToken balance equals underlying 1:1 — transfer amount is the asset amount
           for (const tx of depositTxs) {
-            totalDeposited += BigInt((tx as any).total?.value ?? "0");
+            const rawAmt   = BigInt((tx as any).total?.value ?? "0");
+            const floatAmt = bigintToFloat(rawAmt, v.underlyingDecimals);
+            totalDeposited    += rawAmt;
+            totalDepositFloat += floatAmt;
+
+            const ms = tx.timestamp ? new Date(tx.timestamp).getTime() : null;
+            if (ms) {
+              weightedTsAccum += floatAmt * ms;
+              if (firstDepositMs === null || ms < firstDepositMs) firstDepositMs = ms;
+            }
           }
         } else {
-          // lock / custom: require event decode; bail if any is missing
+          // erc4626 / lock / custom: decode underlying assets from the event log.
+          // Skip individual txs that can't be decoded rather than aborting the vault.
+          const depositNames = v.vaultType === "erc4626"
+            ? ["Deposit"]
+            : ["Deposit", "Supply", "Enter"];
+
           const depositAmounts = await Promise.allSettled(
-            depositTxs.map((tx: any) =>
-              getAssetsFromTx(tx.transaction_hash, ["Deposit", "Supply", "Enter"])
-            )
+            depositTxs.map((tx: any) => getAssetsFromTx(tx.transaction_hash, depositNames))
           );
-          for (const r of depositAmounts) {
-            const amount = r.status === "fulfilled" ? r.value : BigInt(0);
-            if (amount === BigInt(0)) {
-              result.set(key, { netDepositedAssets: 0, firstDepositAt, weightedAvgDepositAt: firstDepositAt });
-              return;
+
+          for (let i = 0; i < depositTxs.length; i++) {
+            const r      = depositAmounts[i];
+            const rawAmt = r.status === "fulfilled" ? r.value : BigInt(0);
+            if (rawAmt === BigInt(0)) continue; // undecodable tx — skip, don't abort
+
+            const floatAmt = bigintToFloat(rawAmt, v.underlyingDecimals);
+            totalDeposited    += rawAmt;
+            totalDepositFloat += floatAmt;
+
+            const ms = depositTxs[i].timestamp ? new Date(depositTxs[i].timestamp).getTime() : null;
+            if (ms) {
+              weightedTsAccum += floatAmt * ms;
+              if (firstDepositMs === null || ms < firstDepositMs) firstDepositMs = ms;
             }
-            totalDeposited += amount;
+          }
+
+          if (totalDeposited === BigInt(0)) {
+            // All deposit txs failed to decode assets — still record the deposit date
+            // from the transfer timestamps so daysHeld is shown even without yield data.
+            const oldestMs = depositTxs.reduce((oldest: number | null, tx: any) => {
+              const ms = tx.timestamp ? new Date(tx.timestamp).getTime() : null;
+              return ms !== null && (oldest === null || ms < oldest) ? ms : oldest;
+            }, null as number | null);
+            result.set(key, {
+              netDepositedAssets:   0,
+              firstDepositAt:       oldestMs !== null ? new Date(oldestMs).toISOString() : null,
+              weightedAvgDepositAt: oldestMs !== null ? new Date(oldestMs).toISOString() : null,
+            });
+            return;
           }
         }
 
-        const withdrawAmounts = await Promise.allSettled(
-          allOutTxs.map((tx: any) =>
-            getAssetsFromTx(tx.transaction_hash, ["Withdraw", "Exit"])
-          )
-        );
-
+        // ── Accumulate withdrawal amounts ───────────────────────────────────
         let totalWithdrawn = BigInt(0);
-        for (let i = 0; i < allOutTxs.length; i++) {
-          const tx      = allOutTxs[i];
-          const r       = withdrawAmounts[i];
-          const decoded = r.status === "fulfilled" ? r.value : BigInt(0);
-          if (decoded > BigInt(0)) {
-            totalWithdrawn += decoded;
-          } else if (tx.to?.hash?.toLowerCase() === NULL_ADDR) {
+
+        if (v.vaultType === "aave") {
+          for (const tx of withdrawTxs) {
             totalWithdrawn += BigInt((tx as any).total?.value ?? "0");
           }
+        } else {
+          const withdrawNames = v.vaultType === "erc4626"
+            ? ["Withdraw"]
+            : ["Withdraw", "Exit"];
+
+          const withdrawAmounts = await Promise.allSettled(
+            withdrawTxs.map((tx: any) => getAssetsFromTx(tx.transaction_hash, withdrawNames))
+          );
+          for (const r of withdrawAmounts) {
+            const decoded = r.status === "fulfilled" ? r.value : BigInt(0);
+            if (decoded > BigInt(0)) totalWithdrawn += decoded;
+            // Skip undecodable withdrawals — overstating net is safer than using share amounts
+          }
         }
 
-        const netRaw = totalDeposited - totalWithdrawn;
+        // ── Build result ────────────────────────────────────────────────────
+        const netRaw        = totalDeposited > totalWithdrawn ? totalDeposited - totalWithdrawn : BigInt(0);
+        const weightedAvgMs = totalDepositFloat > 0 ? weightedTsAccum / totalDepositFloat : null;
+
         result.set(key, {
-          netDepositedAssets:   netRaw > BigInt(0) ? bigintToFloat(netRaw, v.underlyingDecimals) : 0,
-          firstDepositAt,
-          weightedAvgDepositAt: firstDepositAt,  // single deposit point for aave/lock/custom
+          netDepositedAssets:   bigintToFloat(netRaw, v.underlyingDecimals),
+          firstDepositAt:       firstDepositMs !== null ? new Date(firstDepositMs).toISOString() : null,
+          weightedAvgDepositAt: weightedAvgMs  !== null ? new Date(weightedAvgMs).toISOString()  : null,
         });
       } catch { /* network error — skip vault */ }
     })
