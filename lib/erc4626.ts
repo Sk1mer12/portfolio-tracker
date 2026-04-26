@@ -81,6 +81,10 @@ export interface VaultAssetValue {
    *   "lock"    — protocol-specific locked position (e.g. InfiniFi liUSD-Xw)
    */
   vaultType: "erc4626" | "aave" | "lock";
+  /** For "lock" vaults: the unwindingEpochs argument to LockingController.exchangeRate() */
+  lockEpoch?: number;
+  /** For "lock" vaults: LockingController contract address (lowercased) */
+  lockControllerAddress?: string;
 }
 
 /**
@@ -139,6 +143,8 @@ export async function fetchVaultAssetValues(
         underlyingAddress: string;
         underlyingRawAmount: bigint;
         vaultType: "erc4626" | "aave" | "lock";
+        lockEpoch?: number;
+        lockControllerAddress?: string;
       }> = [];
 
       for (let i = 0; i < chainTokens.length; i++) {
@@ -335,6 +341,8 @@ export async function fetchVaultAssetValues(
                   underlyingAddress: INFINIFI_IUSD,
                   underlyingRawAmount: iusdRaw,
                   vaultType: "lock",
+                  lockEpoch: epoch,
+                  lockControllerAddress: lockingControllerAddr,
                 });
               }
             } catch { /* skip InfiniFi pricing on RPC error */ }
@@ -375,6 +383,8 @@ export async function fetchVaultAssetValues(
           underlyingDecimals: decimals,
           underlyingAmount: bigintToFloat(v.underlyingRawAmount, decimals),
           vaultType: v.vaultType,
+          lockEpoch: v.lockEpoch,
+          lockControllerAddress: v.lockControllerAddress,
         });
       }
     })
@@ -498,6 +508,8 @@ export async function fetchVaultDepositInfo(
     underlyingDecimals: number;
     underlyingAddress: string;
     vaultType: "erc4626" | "aave" | "lock" | "custom";
+    lockEpoch?: number;
+    lockControllerAddress?: string;
   }>
 ): Promise<Map<string, VaultDepositInfo>> {
   const result = new Map<string, VaultDepositInfo>();
@@ -652,6 +664,49 @@ export async function fetchVaultDepositInfo(
             }
           }
 
+          // Fallback for lock vaults that accept a proxy input token (e.g. USDC→iUSD
+          // via InfiniFi gateway's mintAndLock). No underlying Transfer(from=user)
+          // appears in these txs, so all three passes in getAssetsFromTx return 0.
+          // Instead: deposited_iUSD = shares_minted × exchangeRate_at_deposit_block.
+          if (
+            totalDeposited === BigInt(0) &&
+            v.vaultType === "lock" &&
+            v.lockEpoch !== undefined &&
+            v.lockControllerAddress
+          ) {
+            const lockClient = getClient(v.chainId);
+            if (lockClient) {
+              const RATE_ABI = parseAbi([
+                "function exchangeRate(uint32 unwindingEpochs) view returns (uint256)",
+              ]);
+              for (const tx of depositTxs) {
+                const sharesRaw = BigInt((tx as any).total?.value ?? "0");
+                if (sharesRaw === BigInt(0)) continue;
+                try {
+                  const blockNum = (tx as any).block_number
+                    ? BigInt((tx as any).block_number) : undefined;
+                  const rate = await lockClient.readContract({
+                    address: v.lockControllerAddress as `0x${string}`,
+                    abi: RATE_ABI,
+                    functionName: "exchangeRate",
+                    args: [v.lockEpoch],
+                    ...(blockNum !== undefined ? { blockNumber: blockNum } : {}),
+                  }) as bigint;
+                  const iusdRaw = (sharesRaw * rate) / BigInt("1000000000000000000");
+                  if (iusdRaw === BigInt(0)) continue;
+                  const floatAmt = bigintToFloat(iusdRaw, v.underlyingDecimals);
+                  totalDeposited    += iusdRaw;
+                  totalDepositFloat += floatAmt;
+                  const ms = tx.timestamp ? new Date(tx.timestamp).getTime() : null;
+                  if (ms) {
+                    weightedTsAccum += floatAmt * ms;
+                    if (firstDepositMs === null || ms < firstDepositMs) firstDepositMs = ms;
+                  }
+                } catch { /* RPC error — skip this tx */ }
+              }
+            }
+          }
+
           if (totalDeposited === BigInt(0)) {
             // All deposit txs failed to decode assets — still record the deposit date
             // from the transfer timestamps so daysHeld is shown even without yield data.
@@ -683,10 +738,37 @@ export async function fetchVaultDepositInfo(
           const withdrawAmounts = await Promise.allSettled(
             withdrawTxs.map((tx: any) => getAssetsFromTx(tx.transaction_hash, withdrawNames))
           );
-          for (const r of withdrawAmounts) {
-            const decoded = r.status === "fulfilled" ? r.value : BigInt(0);
-            if (decoded > BigInt(0)) totalWithdrawn += decoded;
-            // Skip undecodable withdrawals — overstating net is safer than using share amounts
+          for (let i = 0; i < withdrawAmounts.length; i++) {
+            const decoded = withdrawAmounts[i].status === "fulfilled"
+              ? (withdrawAmounts[i] as PromiseFulfilledResult<bigint>).value : BigInt(0);
+            if (decoded > BigInt(0)) { totalWithdrawn += decoded; continue; }
+
+            // Withdrawal fallback for lock vaults — mirror of the deposit fallback.
+            // Needed when the user unlocks via a proxy path (no Withdraw event on the
+            // vault token). Without this, re-locks would double-count deposits.
+            if (v.vaultType === "lock" && v.lockEpoch !== undefined && v.lockControllerAddress) {
+              const tx = withdrawTxs[i];
+              const sharesRaw = BigInt((tx as any).total?.value ?? "0");
+              if (sharesRaw === BigInt(0)) continue;
+              const lockClient = getClient(v.chainId);
+              if (!lockClient) continue;
+              try {
+                const RATE_ABI = parseAbi([
+                  "function exchangeRate(uint32 unwindingEpochs) view returns (uint256)",
+                ]);
+                const blockNum = (tx as any).block_number
+                  ? BigInt((tx as any).block_number) : undefined;
+                const rate = await lockClient.readContract({
+                  address: v.lockControllerAddress as `0x${string}`,
+                  abi: RATE_ABI,
+                  functionName: "exchangeRate",
+                  args: [v.lockEpoch],
+                  ...(blockNum !== undefined ? { blockNumber: blockNum } : {}),
+                }) as bigint;
+                const iusdRaw = (sharesRaw * rate) / BigInt("1000000000000000000");
+                if (iusdRaw > BigInt(0)) totalWithdrawn += iusdRaw;
+              } catch { /* skip */ }
+            }
           }
         }
 
