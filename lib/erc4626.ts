@@ -557,9 +557,20 @@ export async function fetchVaultDepositInfo(
           ),
         ]);
 
-        // Deposits = incoming mints (from 0x0); withdrawals = outgoing burns (to 0x0)
-        const depositTxs  = inItems.filter((t: any) => t.from?.hash?.toLowerCase() === NULL_ADDR);
-        const withdrawTxs = outItems.filter((t: any) => t.to?.hash?.toLowerCase()   === NULL_ADDR);
+        // For ERC-4626: use ALL incoming/outgoing transfers — routers often deposit on
+        // behalf of the user so shares arrive from the router (not 0x0). We use the
+        // presence of a Deposit/Withdraw event at the vault address in getAssetsFromTx
+        // as the discriminator, so DEX buys or wallet-to-wallet share transfers are
+        // naturally skipped (they return BigInt(0) and are ignored).
+        //
+        // For aave/lock/custom: keep the mint/burn (0x0) filter since we have no
+        // ERC-4626 event to verify against and need a reliable deposit signal.
+        const depositTxs = v.vaultType === "erc4626"
+          ? inItems
+          : inItems.filter((t: any) => t.from?.hash?.toLowerCase() === NULL_ADDR);
+        const withdrawTxs = v.vaultType === "erc4626"
+          ? outItems
+          : outItems.filter((t: any) => t.to?.hash?.toLowerCase() === NULL_ADDR);
 
         if (depositTxs.length === 0) return;
 
