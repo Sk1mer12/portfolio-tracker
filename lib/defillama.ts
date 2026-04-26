@@ -81,6 +81,53 @@ const NATIVE_COINGECKO_ID: Record<number, string> = {
 };
 
 /**
+ * Fetch USD prices for tokens at a specific historical Unix timestamp.
+ * Groups requests by timestamp so each unique timestamp needs only one HTTP call.
+ *
+ * Returns a map keyed by `${chainId}:${address}:${unixTimestamp}`.
+ */
+export async function fetchHistoricalTokenPrices(
+  requests: Array<{ address: string; chainId: number; unixTimestamp: number }>
+): Promise<Map<string, number>> {
+  const result = new Map<string, number>();
+  if (requests.length === 0) return result;
+
+  // Group by timestamp
+  const byTimestamp = new Map<number, Array<{ address: string; chainId: number }>>();
+  for (const { address, chainId, unixTimestamp } of requests) {
+    const chain = DEFILLAMA_CHAIN[chainId];
+    if (!chain) continue;
+    const group = byTimestamp.get(unixTimestamp) ?? [];
+    group.push({ address, chainId });
+    byTimestamp.set(unixTimestamp, group);
+  }
+
+  await Promise.allSettled(
+    Array.from(byTimestamp.entries()).map(async ([ts, tokens]) => {
+      const coins = tokens.map(({ address, chainId }) => {
+        const chain = DEFILLAMA_CHAIN[chainId];
+        return `${chain}:${address.toLowerCase()}`;
+      });
+      try {
+        const res = await fetch(`${BASE}/prices/historical/${ts}/${coins.join(",")}`, {
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!res.ok) return;
+        const data: { coins: Record<string, { price?: number }> } = await res.json();
+        for (const { address, chainId } of tokens) {
+          const chain = DEFILLAMA_CHAIN[chainId];
+          const coin  = `${chain}:${address.toLowerCase()}`;
+          const price = data.coins[coin]?.price;
+          if (price != null) result.set(`${chainId}:${address.toLowerCase()}:${ts}`, price);
+        }
+      } catch { /* skip this timestamp */ }
+    })
+  );
+
+  return result;
+}
+
+/**
  * Fetch 30-day price history for a set of token holdings and return daily
  * portfolio value points. Uses DeFiLlama's /chart endpoint (free, no key).
  *

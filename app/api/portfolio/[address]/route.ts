@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchTokenBalances, fetchDefiPositions } from "@/lib/ankr";
 import { fetchNativePrices, fetchTokenLogos } from "@/lib/coingecko";
-import { fetchTokenPricesDefiLlama, fetchTokenPriceHistory } from "@/lib/defillama";
+import { fetchTokenPricesDefiLlama, fetchTokenPriceHistory, fetchHistoricalTokenPrices } from "@/lib/defillama";
 import { fetchVaultAssetValues, fetchVaultDepositInfo, fetchMintBasedVaults } from "@/lib/erc4626";
 import { fetchTokenCostBasis } from "@/lib/cost-basis";
 import { fetchMerklIncentiveAPRs, fetchMerklUserRewards } from "@/lib/merkl";
@@ -264,6 +264,48 @@ export async function GET(
         })
       );
 
+      // ── Historical price lookup for 1:1 vaults ───────────────────────────────
+      // Some vaults (e.g. InfiniFi lock) hold the underlying token at a 1:1 ratio;
+      // the yield comes from the underlying token's own USD price appreciation over
+      // time, not from an exchange-rate increase in the vault itself. When
+      // deposited_underlying ≈ current_underlying (<1% diff), using the current
+      // price for both sides gives deposited == current and hides all yield.
+      // Fix: fetch the historical underlying price at deposit time and use it for
+      // depositedValueUSD so the USD difference reflects the token's price change.
+      const historicalPriceRequests: Array<{
+        address: string; chainId: number; unixTimestamp: number; posKey: string;
+      }> = [];
+      for (const pos of vaultPositions) {
+        const posKey = `${pos.chainId}:${pos.protocolId.toLowerCase()}`;
+        const info  = depositInfoMap.get(posKey);
+        const vault = vaultValues.get(posKey);
+        if (!info || info.netDepositedAssets <= 0 || !vault?.underlyingAddress) continue;
+        const currentUnderlyingAmt = vault.underlyingAmount ?? 0;
+        if (currentUnderlyingAmt <= 0) continue;
+        const ratio = Math.abs(info.netDepositedAssets - currentUnderlyingAmt) / currentUnderlyingAmt;
+        if (ratio > 0.01) continue; // exchange-rate vault — current price approach already works
+        const depositRef = info.weightedAvgDepositAt ?? info.firstDepositAt;
+        if (!depositRef) continue;
+        historicalPriceRequests.push({
+          address: vault.underlyingAddress,
+          chainId: pos.chainId,
+          unixTimestamp: Math.floor(new Date(depositRef).getTime() / 1000),
+          posKey,
+        });
+      }
+      const historicalPriceMap = historicalPriceRequests.length > 0
+        ? await fetchHistoricalTokenPrices(
+            historicalPriceRequests.map(({ address, chainId, unixTimestamp }) => ({
+              address, chainId, unixTimestamp,
+            }))
+          )
+        : new Map<string, number>();
+      const posHistoricalPrice = new Map<string, number>();
+      for (const { address, chainId, unixTimestamp, posKey } of historicalPriceRequests) {
+        const price = historicalPriceMap.get(`${chainId}:${address.toLowerCase()}:${unixTimestamp}`);
+        if (price != null) posHistoricalPrice.set(posKey, price);
+      }
+
       for (const pos of vaultPositions) {
         const posKey = `${pos.chainId}:${pos.protocolId.toLowerCase()}`;
         const info   = depositInfoMap.get(posKey);
@@ -292,7 +334,11 @@ export async function GET(
 
         if (currentUnderlyingAmt <= 0) continue;
 
-        const underlyingPrice  = pos.currentValueUSD / currentUnderlyingAmt;
+        // Use historical deposit price for 1:1 vaults (posHistoricalPrice set above).
+        // For exchange-rate vaults, historicalPrice is undefined and we fall through
+        // to the current-price derivation, which correctly reflects the rate growth.
+        const historicalDepositPrice = posHistoricalPrice.get(posKey);
+        const underlyingPrice = historicalDepositPrice ?? (pos.currentValueUSD / currentUnderlyingAmt);
         pos.depositedValueUSD  = info.netDepositedAssets * underlyingPrice;
         if (pos.depositedValueUSD <= 0) continue;
 
