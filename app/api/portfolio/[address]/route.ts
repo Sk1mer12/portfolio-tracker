@@ -258,6 +258,7 @@ export async function GET(
             chainId:            p.chainId,
             userAddress:        address,
             underlyingDecimals: vaultUnderlyingDecimals.get(`${p.chainId}:${p.protocolId.toLowerCase()}`) ?? 18,
+            underlyingAddress:  v?.underlyingAddress ?? "",
             vaultType:          v?.vaultType ?? "custom",
           };
         })

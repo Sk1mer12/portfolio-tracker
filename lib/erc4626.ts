@@ -496,6 +496,7 @@ export async function fetchVaultDepositInfo(
     chainId: number;
     userAddress: string;
     underlyingDecimals: number;
+    underlyingAddress: string;
     vaultType: "erc4626" | "aave" | "lock" | "custom";
   }>
 ): Promise<Map<string, VaultDepositInfo>> {
@@ -511,9 +512,17 @@ export async function fetchVaultDepositInfo(
       const key       = `${v.chainId}:${vaultAddr}`;
       const NULL_ADDR = "0x0000000000000000000000000000000000000000";
 
-      // Decode underlying asset amount from a transaction's logs.
-      // Pass 1: match by raw topic hash restricted to this vault address.
-      // Pass 2: Blockscout decoded-event fallback for non-standard naming.
+      // ERC-20 Transfer topic — used for the underlying-token fallback
+      const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+      const paddedUser = "0x" + "0".repeat(24) + v.userAddress.slice(2).toLowerCase();
+      const underlyingAddr = v.underlyingAddress.toLowerCase();
+
+      // Decode underlying asset amount from a transaction's logs (three passes):
+      //   Pass 1: ERC-4626 Deposit/Withdraw topic at vault address (exact match).
+      //   Pass 2: Blockscout decoded-event name fallback at vault address.
+      //   Pass 3: ERC-20 Transfer FROM the user on the underlying token contract —
+      //           catches protocols (e.g. InfiniFi locks) that emit no standard
+      //           deposit event on the vault token itself.
       const getAssetsFromTx = async (txHash: string, eventNames: string[]): Promise<bigint> => {
         try {
           const res = await fetch(`${explorer}/api/v2/transactions/${txHash}/logs`, {
@@ -521,6 +530,8 @@ export async function fetchVaultDepositInfo(
           });
           if (!res.ok) return BigInt(0);
           const { items } = await res.json();
+
+          // Pass 1: raw ERC-4626 topic hash, vault address only
           for (const log of items ?? []) {
             const sig     = (log.topics?.[0] ?? "").toLowerCase();
             const logAddr = (log.address?.hash ?? "").toLowerCase();
@@ -533,12 +544,32 @@ export async function fetchVaultDepositInfo(
               if (data.length >= 66) return BigInt("0x" + data.slice(2, 66));
             }
           }
+
+          // Pass 2: Blockscout decoded-event name fallback, vault address only.
+          // Restricting to vaultAddr prevents picking up events from other contracts
+          // in the same tx (e.g. iUSD emitting its own Deposit/Supply event).
           for (const log of items ?? []) {
+            const logAddr = (log.address?.hash ?? "").toLowerCase();
+            if (logAddr !== vaultAddr) continue;
             const method: string = log.decoded?.method_call ?? "";
             if (!eventNames.some((n) => method.startsWith(n))) continue;
             const params: any[] = log.decoded?.parameters ?? [];
             const p = params.find((x: any) => x.name === "assets" || x.name === "amount");
             if (p?.value) return BigInt(p.value);
+          }
+
+          // Pass 3: underlying token Transfer FROM user — fallback for protocols
+          // whose vault token emits no deposit event (e.g. InfiniFi LockingController).
+          // The amount of underlying sent by the user in the same tx = deposited amount.
+          if (underlyingAddr && underlyingAddr !== vaultAddr) {
+            for (const log of items ?? []) {
+              const logAddr = (log.address?.hash ?? "").toLowerCase();
+              if (logAddr !== underlyingAddr) continue;
+              if ((log.topics?.[0] ?? "").toLowerCase() !== ERC20_TRANSFER_TOPIC) continue;
+              if ((log.topics?.[1] ?? "").toLowerCase() !== paddedUser) continue; // from == user
+              const data: string = log.data ?? "";
+              if (data.length >= 66) return BigInt("0x" + data.slice(2, 66));
+            }
           }
         } catch { /* ignore */ }
         return BigInt(0);
