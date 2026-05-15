@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchTokenBalances, fetchDefiPositions } from "@/lib/ankr";
 import { fetchNativePrices, fetchTokenLogos } from "@/lib/coingecko";
-import { fetchTokenPricesDefiLlama, fetchHistoricalTokenPrices } from "@/lib/defillama";
+import { fetchTokenPricesDefiLlama, fetchHistoricalTokenPrices, fetchTokenPriceHistory } from "@/lib/defillama";
 import { fetchPortfolioHistory } from "@/lib/portfolio-history";
 import { fetchVaultAssetValues, fetchVaultDepositInfo, fetchMintBasedVaults } from "@/lib/erc4626";
 import { fetchTokenCostBasis } from "@/lib/cost-basis";
@@ -395,27 +395,46 @@ export async function GET(
             }))
           )
         : Promise.resolve(new Map<string, string>()),
-      fetchPortfolioHistory(
-        address,
-        chainIds,
-        [
-          ...tokens,
-          // DeFi vault underlyings: include as current-balance items (no transfer history
-          // for locked assets, so they fall back to current balance × historical price)
-          ...defiPositions.flatMap((pos) =>
-            pos.tokens
-              .filter((t) => t.type === "underlying" || t.type === "deposit")
-              .map((t) => ({
-                address: t.address,
-                chainId: pos.chainId,
-                balanceFormatted: t.amount,
-                usdValue: t.usdValue,
-                isNative: false as const,
-              }))
+      // Fast mode: use current balances × historical prices (quick, approximate).
+      // Full mode: reconstruct historical balances from Blockscout transfer history
+      //            (accurate — reflects tokens bought/sold in the past).
+      fast
+        ? fetchTokenPriceHistory(
+            [
+              ...tokens,
+              ...defiPositions.flatMap((pos) =>
+                pos.tokens
+                  .filter((t) => t.type === "underlying" || t.type === "deposit")
+                  .map((t) => ({
+                    address: t.address,
+                    chainId: pos.chainId,
+                    balanceFormatted: t.amount,
+                    usdValue: t.usdValue,
+                    isNative: false as const,
+                  }))
+              ),
+            ],
+            chartDays
+          )
+        : fetchPortfolioHistory(
+            address,
+            chainIds,
+            [
+              ...tokens,
+              ...defiPositions.flatMap((pos) =>
+                pos.tokens
+                  .filter((t) => t.type === "underlying" || t.type === "deposit")
+                  .map((t) => ({
+                    address: t.address,
+                    chainId: pos.chainId,
+                    balanceFormatted: t.amount,
+                    usdValue: t.usdValue,
+                    isNative: false as const,
+                  }))
+              ),
+            ],
+            chartDays
           ),
-        ],
-        chartDays
-      ),
       fast
         ? Promise.resolve(new Map<string, import("@/lib/cost-basis").CostBasisResult>())
         : fetchTokenCostBasis(
