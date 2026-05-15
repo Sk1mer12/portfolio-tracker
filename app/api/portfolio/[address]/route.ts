@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchTokenBalances, fetchDefiPositions } from "@/lib/ankr";
 import { fetchNativePrices, fetchTokenLogos } from "@/lib/coingecko";
-import { fetchTokenPricesDefiLlama, fetchHistoricalTokenPrices, fetchTokenPriceHistory } from "@/lib/defillama";
+import { fetchTokenPricesDefiLlama, fetchHistoricalTokenPrices } from "@/lib/defillama";
 import { fetchPortfolioHistory } from "@/lib/portfolio-history";
 import { fetchVaultAssetValues, fetchVaultDepositInfo, fetchMintBasedVaults } from "@/lib/erc4626";
 import { fetchTokenCostBasis } from "@/lib/cost-basis";
@@ -395,27 +395,10 @@ export async function GET(
             }))
           )
         : Promise.resolve(new Map<string, string>()),
-      // Fast mode: use current balances × historical prices (quick, approximate).
-      // Full mode: reconstruct historical balances from Blockscout transfer history
-      //            (accurate — reflects tokens bought/sold in the past).
+      // Chart is skipped in fast mode — the client shows a loading skeleton until
+      // the full enrichment response arrives with accurate historical data.
       fast
-        ? fetchTokenPriceHistory(
-            [
-              ...tokens,
-              ...defiPositions.flatMap((pos) =>
-                pos.tokens
-                  .filter((t) => t.type === "underlying" || t.type === "deposit")
-                  .map((t) => ({
-                    address: t.address,
-                    chainId: pos.chainId,
-                    balanceFormatted: t.amount,
-                    usdValue: t.usdValue,
-                    isNative: false as const,
-                  }))
-              ),
-            ],
-            chartDays
-          )
+        ? Promise.resolve([] as import("@/types/portfolio").PortfolioChartPoint[])
         : fetchPortfolioHistory(
             address,
             chainIds,

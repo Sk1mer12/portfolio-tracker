@@ -11,12 +11,14 @@ import {
 } from "recharts";
 import type { PortfolioChartPoint } from "@/types/portfolio";
 import { formatUSD } from "@/lib/format";
+import { Skeleton } from "@/components/ui/skeleton";
 
 interface Props {
   data: PortfolioChartPoint[];
   title?: string;
   days?: number;
   onDaysChange?: (days: number) => void;
+  isLoading?: boolean;
 }
 
 function CustomTooltip({ active, payload, label }: any) {
@@ -41,7 +43,7 @@ function formatAxisValue(v: number): string {
 
 const RANGE_OPTIONS = [30, 90, 180] as const;
 
-export function PortfolioChart({ data, title = "Portfolio Value", days = 90, onDaysChange }: Props) {
+export function PortfolioChart({ data, title = "Portfolio Value", days = 90, onDaysChange, isLoading = false }: Props) {
   const header = (
     <div className="flex items-center justify-between">
       <h2 className="text-sm font-semibold text-gray-200">{title}</h2>
@@ -65,13 +67,17 @@ export function PortfolioChart({ data, title = "Portfolio Value", days = 90, onD
     </div>
   );
 
-  if (!data || data.length < 2) {
+  if (isLoading || !data || data.length < 2) {
     return (
       <div className="space-y-3">
         {header}
-        <div className="rounded-xl border border-gray-800 bg-gray-900/30 px-4 py-10 text-center text-sm text-gray-500">
-          Not enough historical data to display chart
-        </div>
+        {isLoading ? (
+          <Skeleton className="h-[232px] w-full rounded-xl" />
+        ) : (
+          <div className="rounded-xl border border-gray-800 bg-gray-900/30 px-4 py-10 text-center text-sm text-gray-500">
+            Not enough historical data to display chart
+          </div>
+        )}
       </div>
     );
   }

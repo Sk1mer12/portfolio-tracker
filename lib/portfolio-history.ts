@@ -14,7 +14,7 @@
  */
 
 import { BLOCKSCOUT_BASE } from "@/lib/blockscout";
-import { DEFILLAMA_CHAIN, fetchTokenPriceHistory } from "@/lib/defillama";
+import { DEFILLAMA_CHAIN } from "@/lib/defillama";
 import type { PortfolioChartPoint } from "@/types/portfolio";
 
 const DEFILLAMA_BASE = "https://coins.llama.fi";
@@ -212,7 +212,7 @@ export async function fetchPortfolioHistory(
     ...Array.from(coinKeyToTokenKeys.keys()),
     ...Array.from(nativeBalance.keys()),
   ];
-  if (allCoinKeys.length === 0) return fetchTokenPriceHistory(currentTokens, days);
+  if (allCoinKeys.length === 0) return [];
 
   // ── 4. Fetch 30-day price history from DeFiLlama /chart ─────────────────────
   const priceSeriesByCoinKey = new Map<string, Map<number, number>>();
@@ -243,7 +243,7 @@ export async function fetchPortfolioHistory(
   }
 
   const sortedDayTs = Array.from(allDayTs).sort((a, b) => a - b);
-  if (sortedDayTs.length < 2) return fetchTokenPriceHistory(currentTokens, days);
+  if (sortedDayTs.length < 2) return [];
 
   // ── 5. Forward-fill prices and compute daily portfolio value ─────────────────
   const dailyValues = new Map<number, number>();
@@ -284,7 +284,7 @@ export async function fetchPortfolioHistory(
     }
   }
 
-  if (dailyValues.size < 2) return fetchTokenPriceHistory(currentTokens, days);
+  if (dailyValues.size < 2) return [];
 
   return Array.from(dailyValues.entries())
     .sort(([a], [b]) => a - b)
