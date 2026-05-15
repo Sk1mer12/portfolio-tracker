@@ -25,6 +25,8 @@ export async function GET(
   // fast=true: skip slow per-vault / per-token Blockscout enrichment so the
   // client can render basic data immediately, then re-fetch for full enrichment.
   const fast = searchParams.get("fast") === "true";
+  const daysParam = parseInt(searchParams.get("days") ?? "90", 10);
+  const chartDays = [30, 90, 180].includes(daysParam) ? daysParam : 90;
 
   try {
     let [tokens, defiPositions] = await Promise.all([
@@ -411,7 +413,8 @@ export async function GET(
                 isNative: false as const,
               }))
           ),
-        ]
+        ],
+        chartDays
       ),
       fast
         ? Promise.resolve(new Map<string, import("@/lib/cost-basis").CostBasisResult>())

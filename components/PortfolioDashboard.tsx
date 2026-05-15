@@ -46,6 +46,7 @@ export function PortfolioDashboard({ address }: Props) {
   const [addInput, setAddInput] = useState("");
   const [addError, setAddError] = useState("");
   const addInputRef = useRef<HTMLInputElement>(null);
+  const [chartDays, setChartDays] = useState(90);
 
   // Drive progress bar off phase transitions, not arbitrary time guesses
   useEffect(() => {
@@ -74,7 +75,7 @@ export function PortfolioDashboard({ address }: Props) {
     // ── Phase 1: fast response (~2–4s) ────────────────────────────────────────
     // Skips vault deposit history and token cost basis (the slow Blockscout calls).
     try {
-      const res = await fetch(`/api/portfolio/${address}?chains=${chains}&fast=true`);
+      const res = await fetch(`/api/portfolio/${address}?chains=${chains}&days=${chartDays}&fast=true`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setData(await res.json());
       setLastUpdated(new Date());
@@ -88,12 +89,12 @@ export function PortfolioDashboard({ address }: Props) {
     // ── Phase 2: full enrichment (vault APY, deposit dates, token P&L) ────────
     // Failure is non-fatal — keep phase-1 data, just don't show enriched fields.
     try {
-      const res = await fetch(`/api/portfolio/${address}?chains=${chains}`);
+      const res = await fetch(`/api/portfolio/${address}?chains=${chains}&days=${chartDays}`);
       if (res.ok) setData(await res.json());
     } catch { /* keep fast data */ }
 
     setPhase("done");
-  }, [address, selectedChains]);
+  }, [address, selectedChains, chartDays]);
 
   useEffect(() => {
     fetchPortfolio();
@@ -231,7 +232,9 @@ export function PortfolioDashboard({ address }: Props) {
         {data && (
           <PortfolioChart
             data={data.chartData}
-            title="Portfolio Value Over Time (30d)"
+            title="Portfolio Value Over Time"
+            days={chartDays}
+            onDaysChange={setChartDays}
           />
         )}
 

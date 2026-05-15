@@ -15,6 +15,8 @@ import { formatUSD } from "@/lib/format";
 interface Props {
   data: PortfolioChartPoint[];
   title?: string;
+  days?: number;
+  onDaysChange?: (days: number) => void;
 }
 
 function CustomTooltip({ active, payload, label }: any) {
@@ -37,11 +39,36 @@ function formatAxisValue(v: number): string {
   return `$${v.toFixed(0)}`;
 }
 
-export function PortfolioChart({ data, title = "Portfolio Value" }: Props) {
+const RANGE_OPTIONS = [30, 90, 180] as const;
+
+export function PortfolioChart({ data, title = "Portfolio Value", days = 90, onDaysChange }: Props) {
+  const header = (
+    <div className="flex items-center justify-between">
+      <h2 className="text-sm font-semibold text-gray-200">{title}</h2>
+      {onDaysChange && (
+        <div className="flex gap-1">
+          {RANGE_OPTIONS.map((d) => (
+            <button
+              key={d}
+              onClick={() => onDaysChange(d)}
+              className={`rounded px-2 py-0.5 text-xs font-medium transition-colors ${
+                days === d
+                  ? "bg-indigo-600 text-white"
+                  : "text-gray-500 hover:text-gray-300"
+              }`}
+            >
+              {d}d
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
   if (!data || data.length < 2) {
     return (
       <div className="space-y-3">
-        <h2 className="text-sm font-semibold text-gray-200">{title}</h2>
+        {header}
         <div className="rounded-xl border border-gray-800 bg-gray-900/30 px-4 py-10 text-center text-sm text-gray-500">
           Not enough historical data to display chart
         </div>
@@ -66,7 +93,7 @@ export function PortfolioChart({ data, title = "Portfolio Value" }: Props) {
 
   return (
     <div className="space-y-3">
-      <h2 className="text-sm font-semibold text-gray-200">{title}</h2>
+      {header}
       <div className="rounded-xl border border-gray-800 bg-gray-900 p-4">
         <ResponsiveContainer width="100%" height={200}>
           <LineChart data={data} margin={{ top: 5, right: 16, left: 8, bottom: 5 }}>

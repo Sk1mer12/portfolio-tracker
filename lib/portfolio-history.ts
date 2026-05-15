@@ -18,7 +18,7 @@ import { DEFILLAMA_CHAIN } from "@/lib/defillama";
 import type { PortfolioChartPoint } from "@/types/portfolio";
 
 const DEFILLAMA_BASE = "https://coins.llama.fi";
-const MAX_PAGES = 6; // ~300 transfers per chain; stops early once past the window
+const MAX_PAGES = 12; // ~600 transfers per chain; stops early once past the window
 const CHART_BATCH = 100; // DeFiLlama /chart max keys per request
 
 const NATIVE_COINGECKO_ID: Record<number, string> = {
