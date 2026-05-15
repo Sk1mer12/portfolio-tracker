@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchTokenBalances, fetchDefiPositions } from "@/lib/ankr";
 import { fetchNativePrices, fetchTokenLogos } from "@/lib/coingecko";
-import { fetchTokenPricesDefiLlama, fetchTokenPriceHistory, fetchHistoricalTokenPrices } from "@/lib/defillama";
+import { fetchTokenPricesDefiLlama, fetchHistoricalTokenPrices } from "@/lib/defillama";
+import { fetchPortfolioHistory } from "@/lib/portfolio-history";
 import { fetchVaultAssetValues, fetchVaultDepositInfo, fetchMintBasedVaults } from "@/lib/erc4626";
 import { fetchTokenCostBasis } from "@/lib/cost-basis";
 import { fetchMerklIncentiveAPRs, fetchMerklUserRewards } from "@/lib/merkl";
@@ -392,21 +393,26 @@ export async function GET(
             }))
           )
         : Promise.resolve(new Map<string, string>()),
-      fetchTokenPriceHistory([
-        ...tokens,
-        // Include underlying tokens from DeFi positions so their value is reflected in the chart
-        ...defiPositions.flatMap((pos) =>
-          pos.tokens
-            .filter((t) => t.type === "underlying" || t.type === "deposit")
-            .map((t) => ({
-              address: t.address,
-              chainId: pos.chainId,
-              balanceFormatted: t.amount,
-              usdValue: t.usdValue,
-              isNative: false as const,
-            }))
-        ),
-      ]),
+      fetchPortfolioHistory(
+        address,
+        chainIds,
+        [
+          ...tokens,
+          // DeFi vault underlyings: include as current-balance items (no transfer history
+          // for locked assets, so they fall back to current balance × historical price)
+          ...defiPositions.flatMap((pos) =>
+            pos.tokens
+              .filter((t) => t.type === "underlying" || t.type === "deposit")
+              .map((t) => ({
+                address: t.address,
+                chainId: pos.chainId,
+                balanceFormatted: t.amount,
+                usdValue: t.usdValue,
+                isNative: false as const,
+              }))
+          ),
+        ]
+      ),
       fast
         ? Promise.resolve(new Map<string, import("@/lib/cost-basis").CostBasisResult>())
         : fetchTokenCostBasis(
