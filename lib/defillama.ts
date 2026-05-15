@@ -186,14 +186,35 @@ export async function fetchTokenPriceHistory(
       coins: Record<string, { prices: Array<{ timestamp: number; price: number }> }>;
     } = await res.json();
 
-    // Sum (balance × price) per calendar day across all tokens
-    const dailyValues = new Map<number, number>();
+    // Build per-token price series, then forward-fill missing days before summing.
+    // Without forward-fill, days where some tokens lack price data produce an
+    // artificially low total (missing tokens contribute $0 instead of their last price).
+    const allDays = new Set<number>();
+    const priceSeriesByKey = new Map<string, Map<number, number>>();
+
     for (const [key, info] of Object.entries(data.coins ?? {})) {
       const balance = keyBalanceMap.get(key) ?? 0;
       if (balance === 0 || !info.prices?.length) continue;
+      const series = new Map<number, number>();
       for (const { timestamp, price } of info.prices) {
         const dayTs = Math.floor(timestamp / 86400) * 86400;
-        dailyValues.set(dayTs, (dailyValues.get(dayTs) ?? 0) + balance * price);
+        series.set(dayTs, price);
+        allDays.add(dayTs);
+      }
+      priceSeriesByKey.set(key, series);
+    }
+
+    const sortedDays = Array.from(allDays).sort((a, b) => a - b);
+    const dailyValues = new Map<number, number>();
+
+    for (const [key, series] of priceSeriesByKey) {
+      const balance = keyBalanceMap.get(key) ?? 0;
+      let lastPrice: number | null = null;
+      for (const day of sortedDays) {
+        const price = series.get(day);
+        if (price != null) lastPrice = price;
+        if (lastPrice == null) continue;
+        dailyValues.set(day, (dailyValues.get(day) ?? 0) + balance * lastPrice);
       }
     }
 
