@@ -88,9 +88,18 @@ export function PortfolioDashboard({ address }: Props) {
 
     // ── Phase 2: full enrichment (vault APY, deposit dates, token P&L) ────────
     // Failure is non-fatal — keep phase-1 data, just don't show enriched fields.
+    // Never replace a working chart with an empty one (guards against transient
+    // Blockscout / DeFiLlama failures in the reconstruction path).
     try {
       const res = await fetch(`/api/portfolio/${address}?chains=${chains}&days=${chartDays}`);
-      if (res.ok) setData(await res.json());
+      if (res.ok) {
+        const next = await res.json();
+        setData((prev) =>
+          prev && (next.chartData?.length ?? 0) < 2 && (prev.chartData?.length ?? 0) >= 2
+            ? { ...next, chartData: prev.chartData }
+            : next
+        );
+      }
     } catch { /* keep fast data */ }
 
     setPhase("done");
