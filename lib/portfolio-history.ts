@@ -66,7 +66,10 @@ async function fetchChainTransfers(
   let page = 0;
 
   do {
-    const qs: string = cursor ? `?type=ERC-20&${cursor}` : "?type=ERC-20";
+    // No ?type filter — some Blockscout deployments reject it or return empty.
+    // ERC-721/1155 transfers are harmless: they use different addresses and
+    // have no DeFiLlama price so they never contribute to dailyValues.
+    const qs: string = cursor ? `?${cursor}` : "";
     try {
       const res = await fetch(
         `${base}/api/v2/addresses/${address}/token-transfers${qs}`,
@@ -82,7 +85,11 @@ async function fetchChainTransfers(
 
         const tokenAddress = (item.token?.address ?? "").toLowerCase();
         if (!tokenAddress) continue;
+
+        // Skip NFTs — decimals = 0 means ERC-721/1155 share token
         const decimals = parseInt(item.token?.decimals ?? "18", 10);
+        if (decimals === 0) continue;
+
         const amount = rawToFloat(item.total?.value ?? "0", decimals);
         if (amount <= 0) continue;
 
